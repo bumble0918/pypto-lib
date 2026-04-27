@@ -147,6 +147,12 @@ def golden_gemm_eltwise(tensors):
 
 if __name__ == "__main__":
     import argparse
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+    import torch
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()
@@ -157,8 +163,14 @@ if __name__ == "__main__":
                         help="Chunk size for parallel loop (smaller = more parallel tasks)")
     parser.add_argument("--mix", action="store_true",
                         help="Use fused mix version (default: split version)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for input generation (default: 42)")
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
+
+    # Set random seed for reproducible inputs
+    torch.manual_seed(args.seed)
+    print(f"[INFO] Using random seed: {args.seed}")
 
     if args.mix:
         program = build_gemm_eltwise_mix_program(chunk=args.chunk)

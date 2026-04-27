@@ -110,46 +110,37 @@ def build_qwen3_scope3_program(
 
                 # Stage 3 & 4 & 5: MLP: gate/up projections + SiLU
                 mlp_tile = pl.create_tensor([BATCH_TILE, INTER_CFG], dtype=pl.BF16)
-                for ob in pl.parallel(0, MLP_OUT_BLOCKS, 1):
+                post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                for ob in pl.range(MLP_OUT_BLOCKS):
                     o0 = ob * MLP_OUT_CHUNK
-
-                    post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
-                    post_chunk_1 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, K_CHUNK])
-                    wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
-                    wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj"):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="gate_up_silu"):
                         # Gate projection
+                        wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                         gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
 
-                        wg_1 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [K_CHUNK, o0])
-                        gate_acc = pl.matmul_acc(gate_acc, post_chunk_1, wg_1)
-
-                        for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
 
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_proj"):
                         # Up projection
+                        wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                         up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
 
-                        wu_1 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [K_CHUNK, o0])
-                        up_acc = pl.matmul_acc(up_acc, post_chunk_1, wu_1)
-
-                        for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
+                        # for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="silu"):
                         # SiLU activation
                         sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                         mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                         mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
 
-                    mlp_tile = pl.assemble(mlp_tile, mlp_chunk_bf16, [0, o0])
+                        mlp_tile = pl.assemble(mlp_tile, mlp_chunk_bf16, [0, o0])
 
                 # Stage 6 & 7: Down projection + final residual writeback (fused with chunked_loop_optimizer)
                 with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="down_proj_residual"):
@@ -275,14 +266,26 @@ def build_tensor_specs(
 
 if __name__ == "__main__":
     import argparse
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+    import torch
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for input generation (default: 42)")
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
+
+    # Set random seed for reproducible inputs
+    torch.manual_seed(args.seed)
+    print(f"[INFO] Using random seed: {args.seed}")
 
     result = run(
         program=build_qwen3_scope3_program(),
