@@ -108,28 +108,31 @@ def build_qwen3_scope3_program(
                         normed_bf16 = pl.cast(normed, target_type=pl.BF16)
                         post_norm_tile = pl.assemble(post_norm_tile, normed_bf16, [0, k0])
 
-                # Stage 3 & 4 & 5: MLP: gate/up projections + SiLU
+                # Stage 3 & 4 & 5: MLP: gate/up projections + SiLU (mix-swap + pipeline2)
                 mlp_tile = pl.create_tensor([BATCH_TILE, INTER_CFG], dtype=pl.BF16)
                 post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
-                for ob in pl.range(MLP_OUT_BLOCKS):
-                    o0 = ob * MLP_OUT_CHUNK
-                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="gate_up_silu"):
-                        # Gate projection
+                post_chunk_1 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, K_CHUNK])
+                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="gate_up_silu"):
+                    for ob in pl.parallel(0, MLP_OUT_BLOCKS, chunk=4):
+                        o0 = ob * MLP_OUT_CHUNK
                         wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
-                        gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
+                        wg_1 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [K_CHUNK, o0])
+                        wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
+                        wu_1 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [K_CHUNK, o0])
 
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                        # Gate projection — unroll iter 0 and 1
+                        gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
+                        gate_acc = pl.matmul_acc(gate_acc, post_chunk_1, wg_1)
+                        for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
 
-                        # Up projection
-                        wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
+                        # Up projection — unroll iter 0 and 1
                         up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
-
-                        # for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                        up_acc = pl.matmul_acc(up_acc, post_chunk_1, wu_1)
+                        for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
