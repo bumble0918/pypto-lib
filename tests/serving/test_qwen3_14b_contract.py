@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from serving.contracts.base import LoadedKernelModules
@@ -55,6 +56,27 @@ def test_registry_matches_qwen3_14b_model_config() -> None:
         model_id="local-served-name",
         architecture="Qwen3ForCausalLM",
         architectures=("Qwen3ForCausalLM",),
+        model_type="qwen3",
+        vocab_size=151936,
+        hidden_size=5120,
+        intermediate_size=17408,
+        num_hidden_layers=40,
+        num_attention_heads=40,
+        num_key_value_heads=8,
+        head_dim=128,
+    )
+
+    contract = find_serving_contract_for_model_config(model_config)
+
+    assert contract.model.family == "qwen3"
+    assert contract.model.variant == "14b"
+
+
+def test_registry_matches_qwen3_14b_model_config_with_null_architectures() -> None:
+    model_config = SimpleNamespace(
+        model_id="local-served-name",
+        architecture="Qwen3ForCausalLM",
+        architectures=None,
         model_type="qwen3",
         vocab_size=151936,
         hidden_size=5120,
@@ -207,3 +229,61 @@ def test_kernel_validator_accepts_matching_metadata() -> None:
     )
 
     contract.validate_kernels(contract, loaded, model)
+
+
+def test_prepare_weights_rejects_oversized_lm_head_vocab() -> None:
+    contract = get_serving_contract("qwen3", "14b")
+    model = SimpleNamespace(
+        lm_head=torch.zeros((5, 3)),
+        embed_tokens=torch.zeros((4, 3)),
+        layers=(),
+        final_norm_weight=torch.ones(3),
+    )
+
+    with pytest.raises(ValueError, match=r"Model vocabulary size 5 exceeds"):
+        contract.prepare_weights(model, lambda tensor: tensor, padded_vocab=4)
+
+
+def test_prepare_weights_rejects_oversized_embedding_vocab() -> None:
+    contract = get_serving_contract("qwen3", "14b")
+    model = SimpleNamespace(
+        lm_head=torch.zeros((4, 3)),
+        embed_tokens=torch.zeros((5, 3)),
+        layers=(),
+        final_norm_weight=torch.ones(3),
+    )
+
+    with pytest.raises(ValueError, match=r"Model embedding vocabulary size 5 exceeds"):
+        contract.prepare_weights(model, lambda tensor: tensor, padded_vocab=4)
+
+
+def test_prepare_weights_exports_stacked_decode_weights_once() -> None:
+    contract = get_serving_contract("qwen3", "14b")
+    layer = SimpleNamespace(
+        input_rms_weight=torch.ones(3),
+        wq=torch.ones((3, 3)),
+        wk=torch.ones((2, 3)),
+        wv=torch.ones((2, 3)),
+        q_norm_weight=torch.ones(2),
+        k_norm_weight=torch.ones(2),
+        wo=torch.ones((3, 3)),
+        post_rms_weight=torch.ones(3),
+        w_gate=torch.ones((4, 3)),
+        w_up=torch.ones((4, 3)),
+        w_down=torch.ones((3, 4)),
+    )
+    model = SimpleNamespace(
+        lm_head=torch.zeros((4, 3)),
+        embed_tokens=torch.zeros((4, 3)),
+        layers=(layer,),
+        final_norm_weight=torch.ones(3),
+    )
+    exported = []
+
+    def export(tensor: torch.Tensor) -> torch.Tensor:
+        exported.append(tensor)
+        return tensor
+
+    contract.prepare_weights(model, export, padded_vocab=5, release_layers=False)
+
+    assert len(exported) == 14

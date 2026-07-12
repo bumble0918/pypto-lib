@@ -61,15 +61,27 @@ def prepare_qwen3_weights(
     vocab = int(padded_vocab or QWEN3_14B.vocab)
 
     lm_head_weight = runtime_model.lm_head
-    if vocab != lm_head_weight.shape[0]:
+    if lm_head_weight.shape[0] > vocab:
+        raise ValueError(
+            f"Model vocabulary size {lm_head_weight.shape[0]} exceeds "
+            f"the kernel supported vocabulary size {vocab}."
+        )
+    if lm_head_weight.shape[0] < vocab:
         pad_rows = vocab - lm_head_weight.shape[0]
+        # LM-head padding reuses a valid row so padded logits stay finite and deterministic.
         padding = lm_head_weight[:1].expand(pad_rows, -1).clone()
         lm_head_weight = torch.cat([lm_head_weight, padding], dim=0)
     padded_lm_head_weight = tensor_exporter(lm_head_weight.to(torch.bfloat16).contiguous().cpu())
 
     embed_weight = runtime_model.embed_tokens
-    if vocab != embed_weight.shape[0]:
+    if embed_weight.shape[0] > vocab:
+        raise ValueError(
+            f"Model embedding vocabulary size {embed_weight.shape[0]} exceeds "
+            f"the kernel supported vocabulary size {vocab}."
+        )
+    if embed_weight.shape[0] < vocab:
         pad_rows = vocab - embed_weight.shape[0]
+        # Embedding padding is never a valid sampled token, so zero rows are neutral.
         padding = torch.zeros(
             (pad_rows, embed_weight.shape[1]),
             dtype=embed_weight.dtype,
@@ -80,7 +92,7 @@ def prepare_qwen3_weights(
 
     layers = []
     for layer in runtime_model.layers:
-        layers.append(_kernel_layer_weights(layer, tensor_exporter))
+        layers.append(_kernel_layer_weights(layer))
         if release_layers:
             _release_layer_weights(layer)
 
@@ -114,16 +126,16 @@ def _stack_decode_weights(layers: list[_KernelLayerWeights]) -> dict[str, torch.
     }
 
 
-def _kernel_layer_weights(layer: Any, tensor_exporter: TensorExporter) -> _KernelLayerWeights:
+def _kernel_layer_weights(layer: Any) -> _KernelLayerWeights:
     return _KernelLayerWeights(
-        input_rms_weight=tensor_exporter(layer.input_rms_weight.view(1, -1).float().cpu()),
+        input_rms_weight=layer.input_rms_weight.view(1, -1).float().cpu(),
         wq=_kernel_weight(layer.wq),
         wk=_kernel_weight(layer.wk),
         wv=_kernel_weight(layer.wv),
-        q_norm_weight=tensor_exporter(layer.q_norm_weight.view(1, -1).float().cpu()),
-        k_norm_weight=tensor_exporter(layer.k_norm_weight.view(1, -1).float().cpu()),
+        q_norm_weight=layer.q_norm_weight.view(1, -1).float().cpu(),
+        k_norm_weight=layer.k_norm_weight.view(1, -1).float().cpu(),
         wo=_kernel_weight(layer.wo),
-        post_rms_weight=tensor_exporter(layer.post_rms_weight.view(1, -1).float().cpu()),
+        post_rms_weight=layer.post_rms_weight.view(1, -1).float().cpu(),
         w_gate=_kernel_weight(layer.w_gate),
         w_up=_kernel_weight(layer.w_up),
         w_down=_kernel_weight(layer.w_down),

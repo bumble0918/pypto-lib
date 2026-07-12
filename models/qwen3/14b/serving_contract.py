@@ -14,10 +14,9 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pypto.language as pl
-import torch
 
 from constants import QWEN3_14B, QWEN3_14B_TILING
 from serving.contracts.base import (
@@ -29,6 +28,9 @@ from serving.contracts.base import (
     TensorArgSpec,
 )
 from serving_weights import prepare_qwen3_weights
+
+if TYPE_CHECKING:
+    import torch
 
 
 _KERNEL_DIR = Path(__file__).resolve().parent
@@ -250,6 +252,8 @@ def qwen3_token_embed_host(
 
 def build_prefill_compile_args(model_config: Any, runtime_config: Any) -> tuple[torch.Tensor, ...]:
     """Build dummy compile arguments for the Qwen3 prefill HOST wrapper."""
+    import torch
+
     dims = _dims(model_config, runtime_config)
     total_tokens = dims["batch"] * dims["max_seq"]
     cache_rows = dims["batch"] * dims["runtime_cache_blocks"] * dims["layers"] * dims["kv_heads"] * dims["page"]
@@ -283,6 +287,8 @@ def build_prefill_compile_args(model_config: Any, runtime_config: Any) -> tuple[
 
 def build_decode_compile_args(model_config: Any, runtime_config: Any) -> tuple[torch.Tensor, ...]:
     """Build dummy compile arguments for the Qwen3 decode HOST wrapper."""
+    import torch
+
     dims = _dims(model_config, runtime_config)
     cache_rows = dims["layers"] * dims["batch"] * dims["runtime_cache_blocks"] * dims["kv_heads"] * dims["page"]
     return (
@@ -316,6 +322,8 @@ def build_decode_compile_args(model_config: Any, runtime_config: Any) -> tuple[t
 
 def build_greedy_sample_compile_args(model_config: Any, runtime_config: Any) -> tuple[torch.Tensor, ...]:
     """Build dummy compile arguments for the Qwen3 greedy-sampling HOST wrapper."""
+    import torch
+
     dims = _dims(model_config, runtime_config)
     return (
         torch.empty((dims["batch"], dims["vocab"]), dtype=torch.float32),
@@ -325,6 +333,8 @@ def build_greedy_sample_compile_args(model_config: Any, runtime_config: Any) -> 
 
 def build_token_embed_compile_args(model_config: Any, runtime_config: Any) -> tuple[torch.Tensor, ...]:
     """Build dummy compile arguments for the Qwen3 token-embedding HOST wrapper."""
+    import torch
+
     dims = _dims(model_config, runtime_config)
     return (
         torch.empty((dims["batch"], dims["sampled_ids"]), dtype=torch.int32),
@@ -557,9 +567,10 @@ def get_qwen3_14b_serving_contract() -> ModelServingContract:
 
 def matches_qwen3_14b_model_config(model_config: object) -> bool:
     """Return whether parsed model metadata matches this Qwen3-14B contract."""
+    architectures_raw = getattr(model_config, "architectures", None) or ()
     architectures = {
         _normalize_model_config_value(str(value))
-        for value in getattr(model_config, "architectures", ())
+        for value in architectures_raw
     }
     architecture = getattr(model_config, "architecture", None)
     if architecture is not None:
