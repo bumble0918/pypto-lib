@@ -25,7 +25,7 @@ TensorExporter = Callable[[torch.Tensor], torch.Tensor]
 
 @dataclass(frozen=True)
 class PreparedQwen3Weights:
-    """Kernel-ready Qwen3 weights exposed to serving runtime code."""
+    """Kernel-ready Qwen3 weights exposed to external runtime code."""
 
     final_norm_weight: torch.Tensor
     padded_lm_head_weight: torch.Tensor
@@ -57,7 +57,7 @@ def prepare_qwen3_weights(
     padded_vocab: int | None = None,
     release_layers: bool = True,
 ) -> PreparedQwen3Weights:
-    """Prepare Qwen3-14B weights in the layout expected by the serving kernels."""
+    """Prepare Qwen3-14B weights in the layout expected by the interface kernels."""
     vocab = int(padded_vocab or QWEN3_14B.vocab)
 
     lm_head_weight = runtime_model.lm_head

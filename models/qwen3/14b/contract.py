@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Qwen3-14B serving contract, colocated with the kernel entry points."""
+"""Qwen3-14B external contract, colocated with the kernel entry points."""
 
 from __future__ import annotations
 
@@ -19,15 +19,15 @@ from typing import TYPE_CHECKING, Any
 import pypto.language as pl
 
 from constants import QWEN3_14B, QWEN3_14B_TILING
-from serving.contracts.base import (
+from contract.base import (
     ContractRegistration,
     KernelSpec,
     LoadedKernelModules,
     ModelId,
-    ModelServingContract,
+    ModelContract,
     TensorArgSpec,
 )
-from serving_weights import prepare_qwen3_weights
+from weights import prepare_qwen3_weights
 
 if TYPE_CHECKING:
     import torch
@@ -483,7 +483,7 @@ def load_qwen3_kernel_modules() -> LoadedKernelModules:
 
 
 def validate_qwen3_kernel_modules(
-    contract: ModelServingContract,
+    contract: ModelContract,
     loaded_kernels: LoadedKernelModules,
     model: Any,
 ) -> None:
@@ -518,7 +518,7 @@ def validate_qwen3_kernel_modules(
         )
     if int(runtime.page_size) != QWEN3_14B_TILING.block_size:
         raise ValueError(
-            f"Qwen3-14B serving runtime page_size must match kernel block_size "
+            f"Qwen3-14B external runtime page_size must match kernel block_size "
             f"{QWEN3_14B_TILING.block_size}, got {runtime.page_size}."
         )
     runtime_vocab_pad_multiple = getattr(runtime, "vocab_pad_multiple", None)
@@ -526,7 +526,7 @@ def validate_qwen3_kernel_modules(
         raise TypeError("Qwen3-14B validation expects runtime.vocab_pad_multiple.")
     if int(runtime_vocab_pad_multiple) != QWEN3_14B_TILING.vocab_chunk:
         raise ValueError(
-            f"Qwen3-14B serving runtime vocab_pad_multiple must match kernel vocab_chunk "
+            f"Qwen3-14B external runtime vocab_pad_multiple must match kernel vocab_chunk "
             f"{QWEN3_14B_TILING.vocab_chunk}, got {runtime_vocab_pad_multiple}."
         )
     total_kv_pages = getattr(runtime, "total_kv_pages", None)
@@ -535,9 +535,9 @@ def validate_qwen3_kernel_modules(
     _validate_supported_shape(config)
 
 
-def get_qwen3_14b_serving_contract() -> ModelServingContract:
-    """Return the Qwen3-14B serving ABI contract."""
-    return ModelServingContract(
+def get_qwen3_14b_contract() -> ModelContract:
+    """Return the Qwen3-14B external ABI contract."""
+    return ModelContract(
         schema_version="1",
         model=ModelId(family="qwen3", variant="14b", size="14b", quant="bf16"),
         capabilities=("paged_kv", "chunked_prefill", "device_greedy_sampling", "device_embedding"),
@@ -590,6 +590,11 @@ def _load_kernel_module(module_name: str) -> Any:
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load Qwen3-14B kernel module from {module_path}")
     module = importlib.util.module_from_spec(spec)
+    shadowed_modules = {
+        name: sys.modules.pop(name)
+        for name in ("config", "constants")
+        if _is_other_pypto_lib_short_module(name)
+    }
     sys.path.insert(0, str(_KERNEL_DIR))
     try:
         sys.modules[spec.name] = module
@@ -599,7 +604,16 @@ def _load_kernel_module(module_name: str) -> Any:
             sys.path.remove(str(_KERNEL_DIR))
         except ValueError:
             pass
+        for name, old_module in shadowed_modules.items():
+            sys.modules[name] = old_module
     return module
+
+
+def _is_other_pypto_lib_short_module(name: str) -> bool:
+    module = sys.modules.get(name)
+    module_file = str(getattr(module, "__file__", "") or "")
+    pypto_lib_models_dir = str(_KERNEL_DIR.parent.parent.parent)
+    return module_file.startswith(pypto_lib_models_dir) and not module_file.startswith(str(_KERNEL_DIR))
 
 
 def _dims(model_config: Any, runtime_config: Any) -> dict[str, int]:
@@ -612,7 +626,7 @@ def _dims(model_config: Any, runtime_config: Any) -> dict[str, int]:
         raise ValueError(f"Qwen3-14B kernels require max_seq <= {QWEN3_14B.max_seq}, got {max_seq}")
     if page != QWEN3_14B_TILING.block_size:
         raise ValueError(
-            f"Qwen3-14B serving runtime page_size must match kernel block_size "
+            f"Qwen3-14B external runtime page_size must match kernel block_size "
             f"{QWEN3_14B_TILING.block_size}, got {page}"
         )
     kv_heads = int(model_config.num_key_value_heads)
@@ -717,6 +731,6 @@ _TOKEN_EMBED_STAGE = KernelSpec(
 QWEN3_14B_REGISTRATION = ContractRegistration(
     family="qwen3",
     variant="14b",
-    factory=get_qwen3_14b_serving_contract,
+    factory=get_qwen3_14b_contract,
     matcher=matches_qwen3_14b_model_config,
 )

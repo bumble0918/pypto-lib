@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Phase-1 serving contract dataclasses."""
+"""Phase-1 external contract dataclasses."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ ArgDirection = Literal["in", "out", "inout"]
 
 @dataclass(frozen=True)
 class ModelId:
-    """Stable identity for a model-serving contract."""
+    """Stable identity for an external model contract."""
 
     family: str
     variant: str
@@ -43,7 +43,7 @@ class TensorArgSpec:
 
 @dataclass(frozen=True)
 class KernelSpec:
-    """Phase-1 metadata and hooks for one logical serving kernel stage."""
+    """Phase-1 metadata and hooks for one logical interface kernel stage."""
 
     name: str
     public_name: str
@@ -62,8 +62,8 @@ class LoadedKernelModules:
 
 
 @dataclass(frozen=True)
-class ModelServingContract:
-    """Top-level serving ABI contract owned by pypto-lib."""
+class ModelContract:
+    """Top-level external ABI contract owned by pypto-lib."""
 
     schema_version: str
     model: ModelId
@@ -74,7 +74,7 @@ class ModelServingContract:
     kernel_binder: Callable[..., None]
     prepare_weights: Callable[..., Any]
     load_kernels: Callable[[], LoadedKernelModules]
-    validate_kernels: Callable[["ModelServingContract", LoadedKernelModules, Any], None]
+    validate_kernels: Callable[["ModelContract", LoadedKernelModules, Any], None]
 
     def abi_fingerprint(self) -> str:
         """Return a stable hash of public phase-1 ABI metadata."""
@@ -98,10 +98,10 @@ class ModelServingContract:
 
 @dataclass(frozen=True)
 class ContractRegistration:
-    """Model-owned serving contract registration."""
+    """Model-owned external contract registration."""
 
     family: str
     variant: str
-    factory: Callable[[], ModelServingContract]
+    factory: Callable[[], ModelContract]
     matcher: Callable[[object], bool] | None = None
     implemented: bool = True

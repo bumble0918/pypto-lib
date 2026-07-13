@@ -6,14 +6,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Qwen3-14B model and serving ABI constants."""
+"""Qwen3-14B model and external ABI constants."""
 
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class Qwen3TilingConfig:
-    """Qwen3-14B kernel tiling constants that are part of the serving ABI."""
+    """Qwen3-14B kernel tiling constants that are part of the external ABI."""
 
     seq_tile: int
     vocab_chunk: int

@@ -7,8 +7,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Serving contract registry for PyPTO model kernels."""
+"""External contract registry for PyPTO model kernels."""
 
-from serving.registry import find_serving_contract_for_model_config, get_serving_contract
+from contract.registry import find_contract_for_model_config, get_contract
 
-__all__ = ["find_serving_contract_for_model_config", "get_serving_contract"]
+__all__ = ["find_contract_for_model_config", "get_contract"]

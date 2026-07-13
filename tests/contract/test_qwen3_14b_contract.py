@@ -15,8 +15,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from serving.contracts.base import LoadedKernelModules
-from serving.registry import find_serving_contract_for_model_config, get_serving_contract
+from contract.base import LoadedKernelModules
+from contract.registry import find_contract_for_model_config, get_contract
 
 
 def _tiny_model_config() -> SimpleNamespace:
@@ -42,7 +42,7 @@ def _runtime_config() -> SimpleNamespace:
 
 
 def test_registry_resolves_explicit_qwen3_14b_contract() -> None:
-    contract = get_serving_contract("qwen3", "14b")
+    contract = get_contract("qwen3", "14b")
 
     assert contract.model.family == "qwen3"
     assert contract.model.variant == "14b"
@@ -66,7 +66,7 @@ def test_registry_matches_qwen3_14b_model_config() -> None:
         head_dim=128,
     )
 
-    contract = find_serving_contract_for_model_config(model_config)
+    contract = find_contract_for_model_config(model_config)
 
     assert contract.model.family == "qwen3"
     assert contract.model.variant == "14b"
@@ -87,14 +87,14 @@ def test_registry_matches_qwen3_14b_model_config_with_null_architectures() -> No
         head_dim=128,
     )
 
-    contract = find_serving_contract_for_model_config(model_config)
+    contract = find_contract_for_model_config(model_config)
 
     assert contract.model.family == "qwen3"
     assert contract.model.variant == "14b"
 
 
 def test_stage_arg_specs_match_host_wrapper_signatures() -> None:
-    contract = get_serving_contract("qwen3", "14b")
+    contract = get_contract("qwen3", "14b")
 
     for stage in contract.kernels.values():
         signature_names = tuple(inspect.signature(stage.host_jit_fn._func).parameters)
@@ -102,7 +102,7 @@ def test_stage_arg_specs_match_host_wrapper_signatures() -> None:
 
 
 def test_compile_arg_builders_follow_stage_specs() -> None:
-    contract = get_serving_contract("qwen3", "14b")
+    contract = get_contract("qwen3", "14b")
     model_config = _tiny_model_config()
     runtime_config = _runtime_config()
 
@@ -127,7 +127,7 @@ def test_compile_arg_builders_follow_stage_specs() -> None:
 
 
 def test_runtime_arg_builders_follow_host_order() -> None:
-    contract = get_serving_contract("qwen3", "14b")
+    contract = get_contract("qwen3", "14b")
     static = SimpleNamespace(
         decode_weights={
             "decode_input_rms_weight": "input_rms_weight",
@@ -187,7 +187,7 @@ def test_runtime_arg_builders_follow_host_order() -> None:
 
 
 def test_kernel_validator_accepts_matching_metadata() -> None:
-    contract = get_serving_contract("qwen3", "14b")
+    contract = get_contract("qwen3", "14b")
     loaded = LoadedKernelModules(
         functions={},
         constants={
@@ -232,7 +232,7 @@ def test_kernel_validator_accepts_matching_metadata() -> None:
 
 
 def test_prepare_weights_rejects_oversized_lm_head_vocab() -> None:
-    contract = get_serving_contract("qwen3", "14b")
+    contract = get_contract("qwen3", "14b")
     model = SimpleNamespace(
         lm_head=torch.zeros((5, 3)),
         embed_tokens=torch.zeros((4, 3)),
@@ -245,7 +245,7 @@ def test_prepare_weights_rejects_oversized_lm_head_vocab() -> None:
 
 
 def test_prepare_weights_rejects_oversized_embedding_vocab() -> None:
-    contract = get_serving_contract("qwen3", "14b")
+    contract = get_contract("qwen3", "14b")
     model = SimpleNamespace(
         lm_head=torch.zeros((4, 3)),
         embed_tokens=torch.zeros((5, 3)),
@@ -258,7 +258,7 @@ def test_prepare_weights_rejects_oversized_embedding_vocab() -> None:
 
 
 def test_prepare_weights_exports_stacked_decode_weights_once() -> None:
-    contract = get_serving_contract("qwen3", "14b")
+    contract = get_contract("qwen3", "14b")
     layer = SimpleNamespace(
         input_rms_weight=torch.ones(3),
         wq=torch.ones((3, 3)),

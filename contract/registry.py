@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Serving contract registry."""
+"""External contract registry."""
 
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from serving.contracts.base import ContractRegistration, ModelServingContract
+from contract.base import ContractRegistration, ModelContract
 
 
-class ServingContractNotImplementedError(NotImplementedError):
+class ContractNotImplementedError(NotImplementedError):
     """Raised when a known model contract is registered but not implemented."""
 
 
@@ -31,10 +31,18 @@ def _normalize(value: str) -> str:
 def _qwen3_14b_registration() -> ContractRegistration:
     root = Path(__file__).resolve().parents[1]
     variant_dir = root / "models" / "qwen3" / "14b"
-    module_path = variant_dir / "serving_contract.py"
-    spec = importlib.util.spec_from_file_location("_pypto_lib_qwen3_14b_serving_contract", module_path)
+    module = _load_registration_module(
+        "_pypto_lib_qwen3_14b_contract",
+        variant_dir,
+        variant_dir / "contract.py",
+    )
+    return module.QWEN3_14B_REGISTRATION
+
+
+def _load_registration_module(module_name: str, variant_dir: Path, module_path: Path) -> object:
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load Qwen3-14B serving contract from {module_path}")
+        raise ImportError(f"cannot load external contract from {module_path}")
     module = importlib.util.module_from_spec(spec)
     sys.path.insert(0, str(variant_dir))
     try:
@@ -45,40 +53,40 @@ def _qwen3_14b_registration() -> ContractRegistration:
             sys.path.remove(str(variant_dir))
         except ValueError:
             pass
-    return module.QWEN3_14B_REGISTRATION
+    return module
 
 
 def _registrations() -> tuple[ContractRegistration, ...]:
     return (_qwen3_14b_registration(),)
 
 
-def get_serving_contract(model_family: str, model_variant: str | None = None) -> ModelServingContract:
-    """Return a model-serving contract by explicit family and variant."""
+def get_contract(model_family: str, model_variant: str | None = None) -> ModelContract:
+    """Return an external model contract by explicit family and variant."""
     family = _normalize(model_family)
     variant = _normalize(model_variant or "")
     for registration in _registrations():
         if (_normalize(registration.family), _normalize(registration.variant)) == (family, variant):
             return _registration_contract(registration)
-    raise KeyError(f"unsupported serving contract: family={model_family!r}, variant={model_variant!r}")
+    raise KeyError(f"unsupported external contract: family={model_family!r}, variant={model_variant!r}")
 
 
-def find_serving_contract_for_model_config(model_config: object) -> ModelServingContract:
-    """Return the serving contract that matches parsed model metadata."""
+def find_contract_for_model_config(model_config: object) -> ModelContract:
+    """Return the external contract that matches parsed model metadata."""
     for registration in _registrations():
         if registration.matcher is not None and registration.matcher(model_config):
             return _registration_contract(registration)
     raise KeyError(
-        "unsupported serving contract for model config: "
+        "unsupported external contract for model config: "
         f"model_id={getattr(model_config, 'model_id', None)!r}, "
         f"architecture={getattr(model_config, 'architecture', None)!r}, "
         f"model_type={getattr(model_config, 'model_type', None)!r}"
     )
 
 
-def _registration_contract(registration: ContractRegistration) -> ModelServingContract:
+def _registration_contract(registration: ContractRegistration) -> ModelContract:
     if not registration.implemented:
-        raise ServingContractNotImplementedError(
-            "serving contract is registered but not implemented: "
+        raise ContractNotImplementedError(
+            "external contract is registered but not implemented: "
             f"family={registration.family!r}, variant={registration.variant!r}"
         )
     return registration.factory()
