@@ -74,5 +74,17 @@ script's `--help` and `docs/get-started/platforms.md`.
 3. **Treat `docs/` as the technical source of truth.** Consult
    `.claude/skills/` for task-specific execution, safety, and reporting, and
    keep skills linked to the canonical public guide rather than copying it.
-4. **No private information** (usernames, absolute paths with usernames, etc.) in code or docs.
-5. **All code comments and documentation in English** unless the user explicitly requests otherwise.
+4. **Run the Qwen contract and codegen guard** after changing `contract/`,
+   `models/qwen3_14b/`, `tests/contract/test_qwen3_14b_contract.py`, or
+   `tests/kernels/test_qwen3_rope_codegen.py`:
+
+   ```bash
+   python -m pytest \
+     tests/contract/test_qwen3_14b_contract.py \
+     tests/kernels/test_qwen3_rope_codegen.py
+   ```
+
+   The same guard is enforced by `.github/workflows/ci.yml` through the
+   `qwen-contract-and-codegen-tests` job.
+5. **No private information** (usernames, absolute paths with usernames, etc.) in code or docs.
+6. **All code comments and documentation in English** unless the user explicitly requests otherwise.

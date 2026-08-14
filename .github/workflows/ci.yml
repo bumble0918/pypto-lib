@@ -56,6 +56,7 @@ jobs:
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
       files: ${{ steps.check.outputs.files }}
+      run_qwen_contract_and_codegen_tests: ${{ steps.check.outputs.run_qwen_contract_and_codegen_tests }}
       run_qwen_serving_tests: ${{ steps.check.outputs.run_qwen_serving_tests }}
       run_deepseek_serving_tests: ${{ steps.check.outputs.run_deepseek_serving_tests }}
     steps:
@@ -72,10 +73,12 @@ jobs:
 
           echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
           echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
+          echo "run_qwen_contract_and_codegen_tests=false" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "files=" >> "$GITHUB_OUTPUT"
+            echo "run_qwen_contract_and_codegen_tests=true" >> "$GITHUB_OUTPUT"
             echo "Manual runs retain the full smoke suite."
             exit 0
           fi
@@ -90,6 +93,7 @@ jobs:
                ! git merge-base --is-ancestor "$BEFORE" "${{ github.sha }}"; then
               echo "has_changes=true" >> "$GITHUB_OUTPUT"
               echo "files=" >> "$GITHUB_OUTPUT"
+              echo "run_qwen_contract_and_codegen_tests=true" >> "$GITHUB_OUTPUT"
               echo "Push base is unavailable; retaining the full smoke suite."
               exit 0
             fi
@@ -127,6 +131,9 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ] &&
              printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/qwen3_14b/'; then
             echo "run_qwen_serving_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(contract/|models/qwen3_14b/|tests/contract/test_qwen3_14b_contract.py|tests/kernels/test_qwen3_rope_codegen.py|\.github/workflows/ci.yml|\.github/actions/setup-ci-job/)'; then
+            echo "run_qwen_contract_and_codegen_tests=true" >> "$GITHUB_OUTPUT"
           fi
           if [ "${{ github.event_name }}" = "pull_request" ] &&
              printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_mtp/'; then
@@ -226,6 +233,54 @@ jobs:
             exit 1
           fi
           echo "All selected files passed."
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf build_output
+
+  qwen-contract-and-codegen-tests:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_qwen_contract_and_codegen_tests == 'true'
+    runs-on: [self-hosted, linux, arm64, cpu]
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'false'
+          build-namespace: qwen-contract-codegen
+          pip-cache-name: pip-qwen-contract-codegen
+          toolchain: bundle
+
+      - name: Run Qwen contract and codegen guards
+        shell: bash
+        run: |
+          source activate.sh
+          pip install pytest
+          python -m pytest \
+            tests/contract/test_qwen3_14b_contract.py \
+            tests/kernels/test_qwen3_rope_codegen.py \
+            -q
 
       - name: Clean up build artifacts
         if: always()

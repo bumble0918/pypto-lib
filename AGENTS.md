@@ -47,6 +47,29 @@ plugins:
 - Keep code comments and documentation in English unless the user explicitly
   requests otherwise
 
+## Mandatory Qwen Contract And Codegen Checks
+
+When changing any of the following paths, run the Qwen contract and codegen
+guard before handing off the work:
+
+- `contract/`
+- `models/qwen3_14b/`
+- `tests/contract/test_qwen3_14b_contract.py`
+- `tests/kernels/test_qwen3_rope_codegen.py`
+
+Required command:
+
+```bash
+python -m pytest \
+  tests/contract/test_qwen3_14b_contract.py \
+  tests/kernels/test_qwen3_rope_codegen.py
+```
+
+These tests are also enforced by `.github/workflows/ci.yml` through the
+`qwen-contract-and-codegen-tests` job. They are the guard against kernel ABI,
+contract metadata, compile/runtime argument builders, and generated RoPE code
+drifting out of sync.
+
 ## Preferred Commands
 
 ```bash
