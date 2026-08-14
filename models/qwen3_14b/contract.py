@@ -38,6 +38,7 @@ _KERNEL_DIR = Path(__file__).resolve().parent
 prefill_fwd: Any | None = None
 decode_fwd: Any | None = None
 greedy_sample_fwd: Any | None = None
+topk_select_fwd: Any | None = None
 
 
 def _arg(
@@ -50,7 +51,7 @@ def _arg(
 
 
 _PREFILL_ARGS = (
-    _arg("hidden_states", "bf16", ("PREFILL_TOKENS", "H")),
+    _arg("input_ids", "int32", ("PREFILL_TOKENS",)),
     _arg("seq_lens", "int32", ("BATCH",)),
     _arg("chunk_lens", "int32", ("BATCH",)),
     _arg("chunk_offsets", "int32", ("BATCH",)),
@@ -67,12 +68,13 @@ _PREFILL_ARGS = (
     _arg("k_cache", "bf16", ("KV_CACHE_ROWS", "D"), "inout"),
     _arg("v_cache", "bf16", ("KV_CACHE_ROWS", "D"), "inout"),
     _arg("wo", "bf16", ("L*H", "H")),
+    _arg("post_rms_weight", "fp32", ("L", "H")),
     _arg("w_gate", "bf16", ("L*H", "I")),
     _arg("w_up", "bf16", ("L*H", "I")),
     _arg("w_down", "bf16", ("L*I", "H")),
-    _arg("post_rms_weight", "fp32", ("L", "H")),
     _arg("final_norm_weight", "fp32", (1, "H")),
     _arg("lm_head_weight", "bf16", ("VOCAB", "H")),
+    _arg("embed_weight", "bf16", ("VOCAB", "H")),
     _arg("out", "fp32", ("BATCH", "VOCAB"), "out"),
 )
 
@@ -100,8 +102,15 @@ _DECODE_ARGS = (
     _arg("out", "fp32", ("BATCH", "VOCAB"), "out"),
     _arg("embed_weight", "bf16", ("VOCAB", "H")),
     _arg("sampled_ids_in", "int32", ("BATCH", "SAMPLED_IDS_PAD")),
-    _arg("sampled_ids", "int32", ("BATCH", "SAMPLED_IDS_PAD"), "out"),
+    _arg("sampled_ids_out", "int32", ("BATCH", "SAMPLED_IDS_PAD"), "out"),
     _arg("next_hidden", "bf16", ("BATCH", "H"), "out"),
+)
+
+_TOPK_SELECT_ARGS = (
+    _arg("logits", "fp32", ("BATCH", "VOCAB")),
+    _arg("sampling_control", "int32", ("SAMPLING_CONTROL_FIELDS",)),
+    _arg("topk_values", "fp32", ("BATCH", "TOPK"), "out"),
+    _arg("topk_indices", "int32", ("BATCH", "TOPK"), "out"),
 )
 
 
@@ -110,16 +119,18 @@ def bind_qwen3_kernel_functions(
     prefill_fwd: Any,
     decode_fwd: Any,
     greedy_sample_fwd: Any,
+    topk_select_fwd: Any,
 ) -> None:
     """Bind loaded Qwen3 kernel functions to the HOST wrappers."""
     globals()["prefill_fwd"] = prefill_fwd
     globals()["decode_fwd"] = decode_fwd
     globals()["greedy_sample_fwd"] = greedy_sample_fwd
+    globals()["topk_select_fwd"] = topk_select_fwd
 
 
 @pl.jit.host
 def qwen3_prefill_host(
-    hidden_states: pl.Tensor,
+    input_ids: pl.Tensor,
     seq_lens: pl.Tensor,
     chunk_lens: pl.Tensor,
     chunk_offsets: pl.Tensor,
@@ -136,16 +147,17 @@ def qwen3_prefill_host(
     k_cache: pl.Tensor,
     v_cache: pl.Tensor,
     wo: pl.Tensor,
+    post_rms_weight: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
     w_down: pl.Tensor,
-    post_rms_weight: pl.Tensor,
     final_norm_weight: pl.Tensor,
     lm_head_weight: pl.Tensor,
+    embed_weight: pl.Tensor,
     out: pl.Out[pl.Tensor],
 ) -> pl.Tensor:
     return prefill_fwd(
-        hidden_states,
+        input_ids,
         seq_lens,
         chunk_lens,
         chunk_offsets,
@@ -168,6 +180,7 @@ def qwen3_prefill_host(
         w_down,
         final_norm_weight,
         lm_head_weight,
+        embed_weight,
         out,
     )
 
@@ -197,10 +210,10 @@ def qwen3_decode_host(
     out: pl.Out[pl.Tensor],
     embed_weight: pl.Tensor,
     sampled_ids_in: pl.Tensor,
-    sampled_ids: pl.Out[pl.Tensor],
+    sampled_ids_out: pl.Out[pl.Tensor],
     next_hidden: pl.Out[pl.Tensor],
 ) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
-    logits, sampled_ids, next_hidden = decode_fwd(
+    logits, sampled_ids_out, next_hidden = decode_fwd(
         input_rms_weight,
         wq,
         wk,
@@ -224,10 +237,10 @@ def qwen3_decode_host(
         out,
         embed_weight,
         sampled_ids_in,
-        sampled_ids,
+        sampled_ids_out,
         next_hidden,
     )
-    return logits, sampled_ids, next_hidden
+    return logits, sampled_ids_out, next_hidden
 
 
 @pl.jit.host
@@ -238,6 +251,21 @@ def qwen3_greedy_sample_host(
     return greedy_sample_fwd(logits, sampled_ids)
 
 
+@pl.jit.host
+def qwen3_topk_select_host(
+    logits: pl.Tensor,
+    sampling_control: pl.Tensor,
+    topk_values: pl.Out[pl.Tensor],
+    topk_indices: pl.Out[pl.Tensor],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    return topk_select_fwd(
+        logits,
+        sampling_control,
+        topk_values,
+        topk_indices,
+    )
+
+
 def build_prefill_compile_args(model_config: Any, runtime_config: Any) -> tuple[torch.Tensor, ...]:
     """Build dummy compile arguments for the Qwen3 prefill HOST wrapper."""
     import torch
@@ -246,7 +274,7 @@ def build_prefill_compile_args(model_config: Any, runtime_config: Any) -> tuple[
     total_tokens = dims["batch"] * dims["max_seq"]
     cache_rows = dims["batch"] * dims["runtime_cache_blocks"] * dims["layers"] * dims["kv_heads"] * dims["page"]
     return (
-        torch.empty((total_tokens, dims["hidden"]), dtype=torch.bfloat16),
+        torch.empty((total_tokens,), dtype=torch.int32),
         torch.empty((dims["batch"],), dtype=torch.int32),
         torch.empty((dims["batch"],), dtype=torch.int32),
         torch.empty((dims["batch"],), dtype=torch.int32),
@@ -263,11 +291,12 @@ def build_prefill_compile_args(model_config: Any, runtime_config: Any) -> tuple[
         torch.empty((cache_rows, dims["head_dim"]), dtype=torch.bfloat16),
         torch.empty((cache_rows, dims["head_dim"]), dtype=torch.bfloat16),
         torch.empty((dims["layers"] * dims["hidden"], dims["hidden"]), dtype=torch.bfloat16),
+        torch.empty((dims["layers"], dims["hidden"]), dtype=torch.float32),
         torch.empty((dims["layers"] * dims["hidden"], dims["intermediate"]), dtype=torch.bfloat16),
         torch.empty((dims["layers"] * dims["hidden"], dims["intermediate"]), dtype=torch.bfloat16),
         torch.empty((dims["layers"] * dims["intermediate"], dims["hidden"]), dtype=torch.bfloat16),
-        torch.empty((dims["layers"], dims["hidden"]), dtype=torch.float32),
         torch.empty((1, dims["hidden"]), dtype=torch.float32),
+        torch.empty((dims["vocab"], dims["hidden"]), dtype=torch.bfloat16),
         torch.empty((dims["vocab"], dims["hidden"]), dtype=torch.bfloat16),
         torch.empty((dims["batch"], dims["vocab"]), dtype=torch.float32),
     )
@@ -321,6 +350,19 @@ def build_greedy_sample_compile_args(model_config: Any, runtime_config: Any) -> 
     )
 
 
+def build_topk_select_compile_args(model_config: Any, runtime_config: Any) -> tuple[torch.Tensor, ...]:
+    """Build dummy compile arguments for the Qwen3 top-k HOST wrapper."""
+    import torch
+
+    dims = _dims(model_config, runtime_config)
+    return (
+        torch.empty((dims["batch"], dims["vocab"]), dtype=torch.float32),
+        torch.empty((2,), dtype=torch.int32),
+        torch.empty((dims["batch"], dims["topk"]), dtype=torch.float32),
+        torch.empty((dims["batch"], dims["topk"]), dtype=torch.int32),
+    )
+
+
 def build_prefill_runtime_args(
     inputs: Any,
     static: Any,
@@ -332,7 +374,7 @@ def build_prefill_runtime_args(
     """Build arguments in qwen3_prefill_host signature order."""
     weights = static.decode_weights
     return (
-        inputs.hidden,
+        inputs.token_ids,
         inputs.seq_lens,
         inputs.chunk_lens,
         inputs.chunk_offsets,
@@ -349,12 +391,13 @@ def build_prefill_runtime_args(
         k_cache,
         v_cache,
         weights["decode_wo"],
+        weights["decode_post_rms_weight"],
         weights["decode_w_gate"],
         weights["decode_w_up"],
         weights["decode_w_down"],
-        weights["decode_post_rms_weight"],
         static.final_norm_weight,
         static.padded_lm_head_weight,
+        static.padded_embed_weight,
         logits,
     )
 
@@ -409,20 +452,34 @@ def build_greedy_sample_runtime_args(
     return (inputs.logits, sampled_ids_buffer)
 
 
+def build_topk_select_runtime_args(
+    inputs: Any,
+    static: Any | None = None,
+    *,
+    topk_values_buffer: Any,
+    topk_indices_buffer: Any,
+) -> tuple[Any, ...]:
+    """Build arguments in qwen3_topk_select_host signature order."""
+    return (inputs.logits, inputs.sampling_control, topk_values_buffer, topk_indices_buffer)
+
+
 def load_qwen3_kernel_modules() -> LoadedKernelModules:
     """Load Qwen3-14B kernel functions and constants from this variant directory."""
     modules = {
         "prefill": _load_kernel_module("prefill_fwd"),
         "decode": _load_kernel_module("decode_fwd"),
         "greedy_sample": _load_kernel_module("greedy_sample"),
+        "topk_select": _load_kernel_module("topk_select"),
     }
     decode = modules["decode"]
     greedy_sample = modules["greedy_sample"]
+    topk_select = modules["topk_select"]
     return LoadedKernelModules(
         functions={
             "prefill_fwd": modules["prefill"].prefill_fwd,
             "decode_fwd": decode.decode_fwd,
             "greedy_sample_fwd": greedy_sample.greedy_sample_fwd,
+            "topk_select_fwd": topk_select.topk_select_fwd,
         },
         constants={
             "prefill_seq_tile": int(modules["prefill"].SEQ_TILE),
@@ -440,6 +497,11 @@ def load_qwen3_kernel_modules() -> LoadedKernelModules:
             "greedy_sample_batch_pad": int(greedy_sample.BATCH_PAD),
             "greedy_sample_vocab": int(greedy_sample.VOCAB),
             "greedy_sample_sampled_ids_pad": int(greedy_sample.SAMPLED_IDS_PAD),
+            "topk_select_batch_pad": int(topk_select.BATCH_PAD),
+            "topk_select_vocab": int(topk_select.VOCAB),
+            "topk_select_real_vocab": int(topk_select.REAL_VOCAB),
+            "topk_select_topk": int(topk_select.TOPK),
+            "topk_select_sampling_control_fields": int(topk_select.SAMPLING_CONTROL_FIELDS),
         },
     )
 
@@ -469,6 +531,16 @@ def validate_qwen3_kernel_modules(
     _expect(constants, "decode_sampled_ids_pad", int(contract.limits["sampled_ids_pad"]), "decode sampled width")
     _expect(constants, "greedy_sample_batch_pad", kernel_batch_pad, "greedy_sample_fwd BATCH_PAD mismatch")
     _expect(constants, "greedy_sample_vocab", padded_vocab, "greedy_sample_fwd VOCAB mismatch")
+    _expect(constants, "topk_select_batch_pad", kernel_batch_pad, "topk_select_fwd BATCH_PAD mismatch")
+    _expect(constants, "topk_select_vocab", padded_vocab, "topk_select_fwd VOCAB mismatch")
+    _expect(constants, "topk_select_real_vocab", int(config.vocab_size), "topk_select_fwd REAL_VOCAB mismatch")
+    _expect(constants, "topk_select_topk", int(contract.limits["topk"]), "topk_select_fwd TOPK mismatch")
+    _expect(
+        constants,
+        "topk_select_sampling_control_fields",
+        int(contract.limits["sampling_control_fields"]),
+        "topk_select_fwd sampling_control width mismatch",
+    )
 
     if int(runtime.max_seq_len) > int(constants["decode_max_seq"]):
         raise ValueError(
@@ -499,7 +571,13 @@ def get_qwen3_14b_contract() -> ModelContract:
     return ModelContract(
         schema_version="1",
         model=ModelId(family="qwen3", variant="14b", size="14b", quant="bf16"),
-        capabilities=("paged_kv", "chunked_prefill", "device_greedy_sampling", "device_embedding"),
+        capabilities=(
+            "paged_kv",
+            "chunked_prefill",
+            "device_greedy_sampling",
+            "device_topk_sampling",
+            "device_embedding",
+        ),
         limits={
             # The padded pipeline width. It is the public-batch ceiling for
             # prefill and the standalone greedy_sample stage. DECODE is no longer
@@ -514,13 +592,16 @@ def get_qwen3_14b_contract() -> ModelContract:
             "real_vocab": QWEN3_14B.real_vocab,
             "num_layers": QWEN3_14B.num_layers,
             "sampled_ids_pad": QWEN3_14B.sampled_ids_pad,
+            "topk": QWEN3_14B.topk_select_k,
+            "sampling_control_fields": QWEN3_14B.sampling_control_fields,
             "vocab_pad_multiple": QWEN3_14B_TILING.vocab_chunk,
         },
-        execution={"prefill": ("prefill",), "decode": ("decode",)},
+        execution={"prefill": ("prefill",), "decode": ("decode",), "topk_select": ("topk_select",)},
         kernels={
             "prefill": _PREFILL_STAGE,
             "decode": _DECODE_STAGE,
             "greedy_sample": _GREEDY_SAMPLE_STAGE,
+            "topk_select": _TOPK_SELECT_STAGE,
         },
         kernel_binder=bind_qwen3_kernel_functions,
         prepare_weights=prepare_qwen3_weights,
@@ -618,6 +699,8 @@ def _dims(model_config: Any, runtime_config: Any, batch_limit: int | None = QWEN
         "block_table_stride": (max_seq + page - 1) // page,
         "vocab": _round_up(int(model_config.vocab_size), QWEN3_14B_TILING.vocab_chunk),
         "sampled_ids": QWEN3_14B.sampled_ids_pad,
+        "topk": QWEN3_14B.topk_select_k,
+        "sampling_control_fields": QWEN3_14B.sampling_control_fields,
     }
 
 
@@ -692,6 +775,15 @@ _GREEDY_SAMPLE_STAGE = KernelSpec(
     host_jit_fn=qwen3_greedy_sample_host,
     compile_args_builder=build_greedy_sample_compile_args,
     runtime_args_builder=build_greedy_sample_runtime_args,
+)
+
+_TOPK_SELECT_STAGE = KernelSpec(
+    name="topk_select",
+    public_name="qwen3_14b.topk_select_fwd",
+    args=_TOPK_SELECT_ARGS,
+    host_jit_fn=qwen3_topk_select_host,
+    compile_args_builder=build_topk_select_compile_args,
+    runtime_args_builder=build_topk_select_runtime_args,
 )
 
 QWEN3_14B_REGISTRATION = ContractRegistration(
