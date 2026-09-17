@@ -65,6 +65,46 @@ Once a kernel body lands, its owner can extend the same file with the thin
 | Shared configuration and goldens | `config.py`, `metadata.py`, `golden.py`, `attention_common.py` |
 | Quantization and RoPE tables | `quantization.py`, `rope_tables.py` |
 
+## Decode composition
+
+[decode_layer.py](../../../models/deepseek_v4_1_flash/decode_layer.py) resolves
+all six modes and source ownership from `FLASH.layer_config`. Its complete
+Block skeleton preserves delayed pre-mix ordering: Attention consumes the
+incoming mix, FFN consumes the Attention pre-mix, and the Block returns the
+FFN pre-mix for the next layer. Run the six small CPU Block references with:
+
+```bash
+python models/deepseek_v4_1_flash/decode_layer.py
+```
+
+The full Block device path awaits C1A decode kernels, cache ABI agreement,
+and MoE. `decode_layer_kernel_skip_reason` lists those dependencies.
+
+[decode_attention.py](../../../models/deepseek_v4_1_flash/decode_attention.py)
+provides an independent Attention half-layer entry for implemented SWA and
+C2A Full/Reuse paths. It selects the leaf adapter before JIT dependency
+discovery and does not require MoE. `attention_half_skip_reason` gates
+undelivered C1A paths. For an allocated TP4 group:
+
+```bash
+python models/deepseek_v4_1_flash/decode_attention.py -p a5 -d 0,1,2,3 \
+  --tp 4 --layer-id 3 --tokens 33 --active-tokens 31 --requests 6 \
+  --epochs 2 --save-data
+```
+
+Use representative layer IDs 0, 2, and 3 for SWA, C2A Full, and C2A Reuse.
+TP1 and TP4 are supported by the half-layer validation entry. Each dispatch
+computes mHC mixes/pre and input RMSNorm, invokes Attention with consecutive
+communication epochs, then computes mHC post. Validation reuses each leaf's
+fixture, reference, and precision checks and exposes the intermediate
+boundaries. It checks updated caches and exact non-owner storage.
+
+mHC boundaries cover the full token capacity. RMSNorm and Attention write
+the active prefix; their visible buffers are `InOut` so inactive rows retain
+the caller's values. The Reuse case validates those rows with a nonzero
+sentinel. `attention_hidden` and `attention_pre_mix` are fully written `Out`
+boundaries with shapes `[tokens, 4, 5120]` and `[tokens, 4]` per rank.
+
 Full attention owns compressed KV and index-key publication. Reindex consumes
 the C1A cache and the layer-20 candidate mask but computes a new index query.
 Reuse consumes the source layer's physical Top-K rows and has no compressor or

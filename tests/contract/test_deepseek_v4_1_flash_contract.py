@@ -9,8 +9,10 @@
 """Contract tests for the DeepSeek-V4.1 Flash decode layer composition."""
 
 import ast
+import inspect
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,6 +27,10 @@ from models.deepseek_v4_1_flash.decode_layer import (
     resolve_decode_layer_plan,
 )
 from models.deepseek_v4_1_flash.mhc import golden_mhc_mixes, golden_mhc_pre
+from models.deepseek_v4_1_flash import config as C
+from models.deepseek_v4_1_flash.decode_attention import (
+    attention_half_skip_reason, build_specs, compare_normalized, compare_unchanged, make_attention_program,
+)
 
 
 MODEL_DIR = Path(__file__).parents[2] / "models" / "deepseek_v4_1_flash"
@@ -246,3 +252,80 @@ def test_decode_layer_golden_runs_every_mode(layer_id):
         assert torch.equal(result.attention.compressed_cache, original_compressed)
     if layer_id == 24:
         assert torch.equal(result.attention.index_cache, original_index)
+
+
+@pytest.mark.parametrize("layer_id", REPRESENTATIVE_LAYER_IDS.values())
+def test_attention_half_readiness_is_independent_of_moe(layer_id):
+    reason = attention_half_skip_reason(layer_id)
+    assert "MoE" not in (reason or "")
+    if layer_id < 20:
+        assert reason is None
+    else:
+        assert "cache ABI agreement" in reason
+        with pytest.raises(NotImplementedError, match="attention kernel"):
+            make_attention_program(layer_id, C.TP_SIZE, 1, [])
+
+
+@pytest.mark.parametrize("adapter,leaf", (("_swa", "decode_swa"), ("_c2a_full", "decode_c2a_full"),
+                                         ("_c2a_reuse", "decode_c2a_reuse")))
+def test_attention_half_adapters_keep_leaf_call_contracts(adapter, leaf):
+    function = _function(_tree("decode_attention.py"), adapter)
+    call = next(node for node in ast.walk(function)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == leaf)
+    parameters = _function(_tree(f"{leaf}.py"), leaf).args.args
+    assert [ast.unparse(arg) for arg in call.args] == [
+        "topk_indices" if arg.arg == "compressed_indices" else arg.arg for arg in parameters
+    ]
+    annotations = {arg.arg: ast.unparse(arg.annotation) for arg in function.args.args}
+    for name in ("wq_a_scale", "wq_b_scale", "wkv_scale", "wo_b_scale", "index_wq_b_scale"):
+        assert "pl.MX_B_NN" in annotations[name]
+
+
+@pytest.mark.parametrize("layer_id", (0, 2, 3))
+def test_attention_half_specs_match_host_and_do_not_generate_weights(layer_id, monkeypatch):
+    # Full's existing spec builder is eager; the SWA/Reuse builders stay lazy.
+    if layer_id != 2:
+        def unexpected(*args, **kwargs):
+            raise AssertionError("spec creation generated weights")
+        monkeypatch.setattr("models.deepseek_v4_1_flash.decode_swa.make_inputs", unexpected)
+        monkeypatch.setattr("models.deepseek_v4_1_flash.decode_c2a_reuse.make_c2a_reuse_inputs", unexpected)
+    args = SimpleNamespace(tp=C.TP_SIZE, dp=1, tokens=2, active_tokens=2, requests=2,
+                           epochs=2, seed=17, case="mixed", bench=False)
+    specs = build_specs(args, resolve_decode_layer_plan(layer_id).kind, {})
+    program = make_attention_program(layer_id, C.TP_SIZE, 2, specs)
+    assert [spec.name for spec in specs] == list(inspect.signature(program._func).parameters)
+    parameters = inspect.signature(program._func).parameters
+    for spec in specs:
+        if hasattr(spec, "shape"):
+            assert list(parameters[spec.name].annotation.shape) == spec.shape
+    assert "compressed_indices" not in {spec.name for spec in specs}
+    assert "x" not in {spec.name for spec in specs}
+
+
+def test_attention_half_non_owner_scale_comparison_is_byte_exact():
+    initial = torch.ones(4).to(torch.float8_e4m3fn)
+    compare = compare_unchanged("scale")
+    assert compare(initial.clone(), initial, inputs={"scale": initial})[0]
+    changed = initial.clone()
+    changed.view(torch.uint8)[0] = 0
+    assert not compare(changed, initial, inputs={"scale": initial})[0]
+
+
+def test_attention_half_normalized_suffix_is_byte_exact():
+    expected = torch.full((1, 3, 32), 13.0, dtype=torch.bfloat16)
+    kwargs = dict(inputs={"num_tokens": 2}, actual_outputs={}, expected_outputs={}, rtol=1e-3, atol=1e-3)
+    assert compare_normalized(expected.clone(), expected, **kwargs)[0]
+    changed = expected.clone()
+    changed[:, 2:] = 13.0625
+    assert not compare_normalized(changed, expected, **kwargs)[0]
+
+
+def test_attention_half_partial_outputs_are_inout():
+    tree = _tree("decode_attention.py")
+    for name in ("attention_rank", "attention_group"):
+        function = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name)
+        annotations = {arg.arg: ast.unparse(arg.annotation) for arg in function.args.args}
+        for boundary in ("normalized_attention", "attention_output"):
+            assert annotations[boundary].startswith("pl.InOut[")
+        for boundary in ("attention_input", "attention_hidden", "attention_pre_mix"):
+            assert annotations[boundary].startswith("pl.Out[")
