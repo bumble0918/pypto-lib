@@ -74,20 +74,24 @@ incoming mix, FFN consumes the Attention pre-mix, and the Block returns the
 FFN pre-mix for the next layer. Run the six small CPU Block references with:
 
 ```bash
-python models/deepseek_v4_1_flash/decode_layer.py
+python models/deepseek_v4_1_flash/decode_layer.py --stage block --cpu-golden
 ```
 
 The full Block device path awaits C1A decode kernels, cache ABI agreement,
-and MoE. `decode_layer_kernel_skip_reason` lists those dependencies.
+and MoE. `decode_layer_kernel_skip_reason` lists those dependencies. Both the
+Block factory and `--stage block` device command enforce readiness before JIT
+construction. Block CPU references currently require all capacity rows active;
+the full Block hardware fixture remains pending kernel delivery.
 
-[decode_attention.py](../../../models/deepseek_v4_1_flash/decode_attention.py)
-provides an independent Attention half-layer entry for implemented SWA and
+The same file provides `--stage attention` (the default) for implemented SWA and
 C2A Full/Reuse paths. It selects the leaf adapter before JIT dependency
 discovery and does not require MoE. `attention_half_skip_reason` gates
-undelivered C1A paths. For an allocated TP4 group:
+undelivered C1A paths. `make_decode_layer_program` selects the stage in Python;
+both stages use `make_attention_rank` for the same Attention orchestration.
+For an allocated TP4 group:
 
 ```bash
-python models/deepseek_v4_1_flash/decode_attention.py -p a5 -d 0,1,2,3 \
+python models/deepseek_v4_1_flash/decode_layer.py --stage attention -p a5 -d 0,1,2,3 \
   --tp 4 --layer-id 3 --tokens 33 --active-tokens 31 --requests 6 \
   --epochs 2 --save-data
 ```
@@ -104,6 +108,8 @@ the active prefix; their visible buffers are `InOut` so inactive rows retain
 the caller's values. The Reuse case validates those rows with a nonzero
 sentinel. `attention_hidden` and `attention_pre_mix` are fully written `Out`
 boundaries with shapes `[tokens, 4, 5120]` and `[tokens, 4]` per rank.
+Normalized and hidden precision statistics cover active rows only; the inactive
+suffix is checked independently so it cannot dilute the active error budget.
 
 Full attention owns compressed KV and index-key publication. Reindex consumes
 the C1A cache and the layer-20 candidate mask but computes a new index query.
