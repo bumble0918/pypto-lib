@@ -55,14 +55,9 @@ from models.deepseek_v4_1_flash.decode_c2a_full import decode_c2a_full, golden_d
 from models.deepseek_v4_1_flash.decode_c2a_reuse import decode_c2a_reuse, golden_decode_c2a_reuse
 from models.deepseek_v4_1_flash.decode_swa import decode_swa, golden_decode_swa, make_norm
 from models.deepseek_v4_1_flash.golden import rms_norm
-from models.deepseek_v4_1_flash.mhc import (
-    golden_mhc_mixes,
-    golden_mhc_post,
-    golden_mhc_pre,
-    mhc_mixes,
-    mhc_post,
-    mhc_pre,
-)
+from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
+from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post
+from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
 from models.deepseek_v4_1_flash.moe import golden_moe, moe
 
 
@@ -121,6 +116,7 @@ _ATTENTION_GOLDENS = {
     DecodeLayerKind.C1A_REUSE: golden_decode_c1a_reuse,
 }
 
+# Readiness includes composition ABI agreement and integration acceptance.
 _ATTENTION_KERNEL_READY = {
     DecodeLayerKind.SWA: True,
     DecodeLayerKind.C2A_FULL: True,
@@ -169,10 +165,10 @@ def decode_layer_kernel_skip_reason(layer_id: int) -> str | None:
     plan = resolve_decode_layer_plan(layer_id)
     missing = []
     if not _ATTENTION_KERNEL_READY[plan.kind]:
-        missing.append(f"{plan.kind.name} attention kernel")
+        missing.append(f"{plan.kind.name} attention kernel integration")
         missing.append("C1A cache ABI agreement")
     if not _MOE_KERNEL_READY:
-        missing.append("EP8 MoE kernel")
+        missing.append("EP8 MoE kernel integration")
     return None if not missing else "decode_layer requires " + " and ".join(missing)
 
 
@@ -701,7 +697,7 @@ def attention_half_skip_reason(layer_id):
     """Check only half-layer dependencies; MoE does not gate this entry."""
     kind = resolve_decode_layer_plan(layer_id).kind
     if not _ATTENTION_KERNEL_READY[kind]:
-        return f"{kind.name} attention kernel and C1A cache ABI agreement are pending"
+        return f"{kind.name} attention kernel integration and C1A cache ABI agreement are pending"
     return None
 
 
@@ -1494,7 +1490,7 @@ def main():
         return
     if args.stage == "block":
         reason = decode_layer_kernel_skip_reason(args.layer_id)
-        parser.error(reason or "Block hardware fixture is pending kernel delivery")
+        parser.error(reason or "Block hardware fixture is pending integration")
     if not 1 <= args.tokens <= C.DECODE_MAX_TOKENS or not 1 <= args.epochs <= 1000:
         parser.error("tokens or epochs out of range")
     args.active_tokens = args.tokens if args.active_tokens is None else args.active_tokens

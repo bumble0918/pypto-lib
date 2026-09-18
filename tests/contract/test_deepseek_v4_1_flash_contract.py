@@ -166,7 +166,8 @@ def test_decode_layer_unfinished_device_dependencies_are_explicit(layer_id, comp
 @pytest.mark.parametrize("layer_id", (0, 2, 3, 20, 24, 21))
 def test_decode_layer_golden_runs_every_mode(layer_id, composition):
     from models.deepseek_v4_1_flash._golden_smoke import make_decode_layer_golden_inputs
-    from models.deepseek_v4_1_flash.mhc import golden_mhc_mixes, golden_mhc_pre
+    from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes
+    from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre
 
     golden_decode_layer = composition.golden_decode_layer
     decode_layer_attention_inputs = composition.decode_layer_attention_inputs
