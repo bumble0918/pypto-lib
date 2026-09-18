@@ -44,13 +44,10 @@ from models.deepseek_v4_1_flash.config import (
 from models.deepseek_v4_1_flash.decode_swa import (
     M_TILE,
     SOFTMAX_SCALE,
-    grouped_output,
-    project_ob,
 )
-
-
+from models.deepseek_v4_1_flash.o_proj import prefill_o_proj
 from models.deepseek_v4_1_flash.qkv_proj_rope import (
-    WORKER_TILE, make_prefill_rope,
+    WORKER_TILE,
     prefill_q_proj_qr, prefill_q_proj_rope, prefill_kv_proj_rope,
 )
 
@@ -188,9 +185,6 @@ def prefill_attend_window(
     return output
 
 
-prefill_rotate_output = make_prefill_rope(LOCAL_H, inverse=True)
-
-
 def golden_prefill_attn_swa(
     x: torch.Tensor,
     wq_a: torch.Tensor,
@@ -298,9 +292,8 @@ def prefill_attn_swa(
         prefill_q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, qb, q, active)
         prefill_gather_window(window_cache, window_cache_scale, chunk_indices, selected, active)
         prefill_attend_window(q, selected, chunk_indices, attn_sink, attended, active)
-        prefill_rotate_output(attended, chunk_cos, chunk_sin, unrotated, active)
-        grouped_output(unrotated, wo_a, latent, active)
-        project_ob(latent, wo_b, wo_b_scale, chunk_partial, active)
+        prefill_o_proj(attended, wo_a, wo_b, wo_b_scale, chunk_cos, chunk_sin,
+                       unrotated, latent, chunk_partial, active)
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):

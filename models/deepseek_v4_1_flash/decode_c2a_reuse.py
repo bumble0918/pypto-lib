@@ -73,11 +73,9 @@ from models.deepseek_v4_1_flash.decode_c2a_full import (
     official_rope,
 )
 from models.deepseek_v4_1_flash.decode_swa import (
-    grouped_output,
-    project_ob,
     publish_window,
-    rotate_output,
 )
+from models.deepseek_v4_1_flash.o_proj import o_proj
 from models.deepseek_v4_1_flash.qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
 from models.deepseek_v4_1_flash.quantization import decode_e8m0
 
@@ -148,10 +146,9 @@ def c2a_reuse_partial(
         )
 
     unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens)
     output_latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
-    grouped_output(unrotated, wo_a, output_latent, num_tokens)
-    project_ob(output_latent, wo_b, wo_b_scale, partial, num_tokens)
+    o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+           unrotated, output_latent, partial, num_tokens)
     return chunk_done
 
 

@@ -48,15 +48,14 @@ from models.deepseek_v4_1_flash.config import (
     TP_SIZE,
     WINDOW_CACHE_GROUP,
 )
-
-
+from models.deepseek_v4_1_flash.o_proj import o_proj
 from models.deepseek_v4_1_flash.qkv_proj_rope import (
     EPS as EPS,
     K_TILE as K_TILE,
     N_TILE as N_TILE,
     make_norm as make_norm,
-    make_projection,
-    make_rope,
+    make_projection as make_projection,
+    make_rope as make_rope,
     q_proj_qr,
     q_proj_rope,
     kv_proj_rope,
@@ -194,39 +193,8 @@ def attend_window(
     return output
 
 
-@pl.jit.inline
-def grouped_output(
-    x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    weight: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    for block in pl.spmd((num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE),
-                         name_hint="swa_grouped_output"):
-        t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
-        n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
-        group = n0 // O_LORA
-        local_n = n0 % O_LORA
-        rows = pl.min(M_TILE, num_tokens - t0)
-        acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-        for kb in pl.range(O_GROUP_IN // K_TILE):
-            k0 = kb * K_TILE
-            a = pl.slice(x, [M_TILE, K_TILE], [t0, group * O_GROUP_IN + k0],
-                         valid_shape=[rows, K_TILE])
-            w = pl.reshape(weight[group:group + 1, local_n:local_n + N_TILE, k0:k0 + K_TILE],
-                           [N_TILE, K_TILE])
-            acc = pl.matmul_acc(acc, a, w, b_trans=True, init_cond=(kb == 0))
-        value = pl.cast(acc, pl.BF16, mode="rint")
-        output[t0:t0 + M_TILE, n0:n0 + N_TILE] = pl.set_validshape(value, rows, N_TILE)
-    return output
-
-
 if TP_SIZE not in (1, 2, 4):
     raise ValueError("Decode SWA currently supports TP1, TP2, and TP4; TP8 requires head-tile padding")
-
-project_ob = make_projection(LOCAL_O_WIDTH, D, pl.FP32)
-rotate_output = make_rope(LOCAL_H, inverse=True)
-
 
 def golden_decode_swa(
     x: torch.Tensor,
@@ -316,10 +284,9 @@ def decode_swa_partial(
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_window(q, selected, window_indices, attn_sink, attended, num_tokens)
     unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens)
     latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
-    grouped_output(unrotated, wo_a, latent, num_tokens)
-    project_ob(latent, wo_b, wo_b_scale, output, num_tokens)
+    o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+           unrotated, latent, output, num_tokens)
     return cache_consumed
 
 

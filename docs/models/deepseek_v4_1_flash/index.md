@@ -109,6 +109,12 @@ Cache publication and TP communication stay in the Attention caller.
 C1A uses its existing preprocessing until its independent golden baseline
 and migration are accepted.
 
+`o_proj.py` combines inverse RoPE, grouped Wo-A, and MXFP8 Wo-B into
+an FP32 TP-local partial output. SWA/C2A call `o_proj`; prefill SWA calls
+`prefill_o_proj` to preserve its fixed-worker RoPE schedule. The caller
+owns the unrotated/latent scratch and runs the original prefill/decode
+TP all-reduce. C1A retains its existing output path pending migration.
+
 TP1 and TP4 are supported by the half-layer validation entry. Each dispatch
 computes mHC mixes/pre and input RMSNorm, invokes Attention with consecutive
 communication epochs, then computes mHC post. Validation reuses each leaf's

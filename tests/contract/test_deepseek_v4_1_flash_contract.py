@@ -372,3 +372,25 @@ def test_prefill_swa_keeps_specialized_qkv_stages():
         specialized = getattr(qkv_proj_rope, f"prefill_{name}")
         assert getattr(prefill_attn_swa, f"prefill_{name}") is specialized
         assert specialized is not getattr(qkv_proj_rope, name)
+
+
+@requires_pypto
+@pytest.mark.parametrize("module_name", ("decode_swa", "decode_c2a_full", "decode_c2a_reuse"))
+def test_attention_uses_shared_output_projection(module_name):
+    from importlib import import_module
+
+    from models.deepseek_v4_1_flash import o_proj
+
+    attention = import_module(f"models.deepseek_v4_1_flash.{module_name}")
+    assert attention.o_proj is o_proj.o_proj
+    assert list(inspect.signature(o_proj.o_proj._func).parameters)[-4:] == [
+        "unrotated", "latent", "partial", "num_tokens",
+    ]
+
+
+@requires_pypto
+def test_prefill_swa_keeps_specialized_output_projection():
+    from models.deepseek_v4_1_flash import o_proj, prefill_attn_swa
+
+    assert prefill_attn_swa.prefill_o_proj is o_proj.prefill_o_proj
+    assert o_proj.prefill_o_proj is not o_proj.o_proj
