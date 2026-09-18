@@ -347,3 +347,28 @@ def test_stage_selection_checks_only_required_dependencies(composition):
         composition.make_decode_layer_program(0, composition.C.EP_SIZE, 1, stage="block")
     with pytest.raises(ValueError, match="unknown decode stage"):
         composition.make_decode_layer_program(0, 1, 1, stage="ffn")
+
+
+@requires_pypto
+@pytest.mark.parametrize("module_name", ("decode_swa", "decode_c2a_full", "decode_c2a_reuse"))
+def test_attention_uses_shared_qkv_stages(module_name):
+    from importlib import import_module
+
+    from models.deepseek_v4_1_flash import qkv_proj_rope
+
+    attention = import_module(f"models.deepseek_v4_1_flash.{module_name}")
+    for name in ("q_proj_qr", "q_proj_rope", "kv_proj_rope"):
+        assert getattr(attention, name) is getattr(qkv_proj_rope, name)
+    assert list(inspect.signature(qkv_proj_rope.q_proj_qr._func).parameters)[-3:] == [
+        "projected", "normalized", "num_tokens",
+    ]
+
+
+@requires_pypto
+def test_prefill_swa_keeps_specialized_qkv_stages():
+    from models.deepseek_v4_1_flash import prefill_attn_swa, qkv_proj_rope
+
+    for name in ("q_proj_qr", "q_proj_rope", "kv_proj_rope"):
+        specialized = getattr(qkv_proj_rope, f"prefill_{name}")
+        assert getattr(prefill_attn_swa, f"prefill_{name}") is specialized
+        assert specialized is not getattr(qkv_proj_rope, name)

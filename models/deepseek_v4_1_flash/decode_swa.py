@@ -35,12 +35,10 @@ from models.deepseek_v4_1_flash.attention_common import AttentionGoldenResult, g
 from models.deepseek_v4_1_flash.config import (
     D,
     DECODE_MAX_TOKENS,
-    FLASH,
     HEAD_DIM,
     LOCAL_H,
     LOCAL_O_GROUPS,
     LOCAL_O_WIDTH,
-    NOPE_DIM,
     O_GROUP_IN,
     O_LORA,
     ORI_BLOCKS_DYN,
@@ -52,164 +50,24 @@ from models.deepseek_v4_1_flash.config import (
 )
 
 
+from models.deepseek_v4_1_flash.qkv_proj_rope import (
+    EPS as EPS,
+    K_TILE as K_TILE,
+    N_TILE as N_TILE,
+    make_norm as make_norm,
+    make_projection,
+    make_rope,
+    q_proj_qr,
+    q_proj_rope,
+    kv_proj_rope,
+)
+
+
 # Model configuration.
-EPS = FLASH.rms_norm_eps
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
 
-# Tiling. The mixed FP8 V2C pipe requires 32 physical rows on the pinned toolchain.
+# Attention tiling.
 M_TILE = 16
-MX_M_TILE = 32
-N_TILE = 128
-K_TILE = 256
-
-def make_projection(width, output_width, output_dtype=pl.BF16):
-    """Specialize an MXFP8 projection without expanding weights in HBM."""
-    fp32_output = output_dtype == pl.FP32
-
-    @pl.jit.inline
-    def project(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
-        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Tensor[[T_DYN, output_width], output_dtype],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
-            t0 = mt * MX_M_TILE
-            for block in pl.spmd(output_width // N_TILE, name_hint="swa_mx_projection"):
-                n0 = block * N_TILE
-                rows = pl.min(MX_M_TILE, num_tokens - t0)
-                first = pl.load(x, [t0, 0], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
-                first = pl.set_validshape(pl.fillpad(first, pad_value=pl.PadValue.zero), MX_M_TILE, K_TILE)
-                # s = 2**ceil(log2(max(amax, 1e-4) / 448)); native quant_mx uses a different rule.
-                firstq_values = pl.reshape(pl.cast(first, pl.FP32), [MX_M_TILE * (K_TILE // 32), 32])
-                firstq_reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
-                firstq_maximum = pl.maximum(pl.row_max(pl.abs(firstq_values), tmp_tile=firstq_reduce_tmp), 1e-4)
-                firstq_bits = pl.reinterpret_view(pl.mul(firstq_maximum, 1.0 / 448.0), pl.INT32)
-                firstq_exponent = pl.shrs(pl.add(firstq_bits, 8388607), 23)
-                firstq_scale = pl.reinterpret_view(pl.shls(firstq_exponent, 23), pl.FP32)
-                firstq_quantized = pl.cast(pl.row_expand_div(firstq_values, firstq_scale), pl.FP8E4M3FN, mode="rint")
-                firstq_payload = pl.reshape(firstq_quantized, [MX_M_TILE, K_TILE])
-                firstq_signed_exponent = pl.sub(firstq_exponent, pl.mul(pl.shrs(firstq_exponent, 7), 256))
-                firstq_codes = pl.reinterpret_view(pl.cast(firstq_signed_exponent, pl.INT8), pl.UINT8)
-                firstq_flat = pl.reshape(firstq_codes, [1, MX_M_TILE * (K_TILE // 32)])
-                firstq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-                firstq_packed = pl.tmov_x2zz(firstq_flat, firstq_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8)
-                a0 = firstq_payload
-                sa0 = pl.reinterpret_view(firstq_packed, pl.FP8E8M0)
-                b0 = pl.load(weight, [0, n0], [K_TILE, N_TILE])
-                sb0 = pl.load(scale, [0, n0], [K_TILE // 32, N_TILE])
-                acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                for kb in pl.range(1, width // K_TILE):
-                    k0 = kb * K_TILE
-                    values = pl.load(x, [t0, k0], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
-                    values = pl.set_validshape(pl.fillpad(values, pad_value=pl.PadValue.zero), MX_M_TILE, K_TILE)
-                    nextq_values = pl.reshape(pl.cast(values, pl.FP32), [MX_M_TILE * (K_TILE // 32), 32])
-                    nextq_reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
-                    nextq_maximum = pl.maximum(pl.row_max(pl.abs(nextq_values), tmp_tile=nextq_reduce_tmp), 1e-4)
-                    nextq_bits = pl.reinterpret_view(pl.mul(nextq_maximum, 1.0 / 448.0), pl.INT32)
-                    nextq_exponent = pl.shrs(pl.add(nextq_bits, 8388607), 23)
-                    nextq_scale = pl.reinterpret_view(pl.shls(nextq_exponent, 23), pl.FP32)
-                    nextq_quantized = pl.cast(pl.row_expand_div(nextq_values, nextq_scale), pl.FP8E4M3FN, mode="rint")
-                    nextq_payload = pl.reshape(nextq_quantized, [MX_M_TILE, K_TILE])
-                    nextq_signed_exponent = pl.sub(nextq_exponent, pl.mul(pl.shrs(nextq_exponent, 7), 256))
-                    nextq_codes = pl.reinterpret_view(pl.cast(nextq_signed_exponent, pl.INT8), pl.UINT8)
-                    nextq_flat = pl.reshape(nextq_codes, [1, MX_M_TILE * (K_TILE // 32)])
-                    nextq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-                    nextq_packed = pl.tmov_x2zz(nextq_flat, nextq_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8)
-                    a = nextq_payload
-                    sa = pl.reinterpret_view(nextq_packed, pl.FP8E8M0)
-                    b = pl.load(weight, [k0, n0], [K_TILE, N_TILE])
-                    sb = pl.load(scale, [k0 // 32, n0], [K_TILE // 32, N_TILE])
-                    acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-                if fp32_output:
-                    output = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE), [t0, n0], output)
-                else:
-                    value = pl.cast(acc, target_type=pl.BF16, mode="rint")
-                    output = pl.store(pl.set_validshape(value, rows, N_TILE), [t0, n0], output)
-        return output
-
-    return project
-
-
-def make_norm(width):
-    @pl.jit.inline
-    def normalize(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width], pl.BF16],
-        output: pl.Tensor[[T_DYN, width], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        if width == D:
-            # Chunk the hidden dimension to retain aligned row reductions within Vec capacity.
-            for block in pl.spmd((num_tokens + 7) // 8, name_hint="swa_hidden_rmsnorm"):
-                t = block * 8
-                rows = pl.min(8, num_tokens - t)
-                square_sum = pl.full([1, 8], dtype=pl.FP32, value=0.0)
-                for chunk in pl.pipeline(width // 128, stage=2):
-                    d0 = chunk * 128
-                    source_chunk = pl.slice(x, [8, 128], [t, d0], valid_shape=[rows, 128])
-                    source_chunk = pl.set_validshape(pl.fillpad(source_chunk, pad_value=pl.PadValue.zero), 8, 128)
-                    value_chunk = pl.cast(source_chunk, pl.FP32)
-                    chunk_sum = pl.reshape(pl.row_sum(pl.mul(value_chunk, value_chunk)), [1, 8])
-                    square_sum = pl.add(square_sum, chunk_sum)
-                inverse = pl.rsqrt(pl.add(pl.mul(square_sum, 1.0 / width), EPS), high_precision=True)
-                inverse_col = pl.reshape(inverse, [8, 1])
-                for chunk in pl.pipeline(width // 128, stage=2):
-                    d0 = chunk * 128
-                    source_chunk = pl.slice(x, [8, 128], [t, d0], valid_shape=[rows, 128])
-                    source_chunk = pl.set_validshape(pl.fillpad(source_chunk, pad_value=pl.PadValue.zero), 8, 128)
-                    value_chunk = pl.cast(source_chunk, pl.FP32)
-                    gamma_chunk = pl.reshape(pl.cast(weight[d0:d0 + 128], pl.FP32), [1, 128])
-                    result_chunk = pl.col_expand_mul(pl.row_expand_mul(value_chunk, inverse_col), gamma_chunk)
-                    output[t:t + 8, d0:d0 + 128] = pl.set_validshape(pl.cast(result_chunk, pl.BF16, mode="rint"), rows, 128)
-        else:
-            for block in pl.spmd((num_tokens + 7) // 8, name_hint="swa_rmsnorm"):
-                t = block * 8
-                rows = pl.min(8, num_tokens - t)
-                source = pl.slice(x, [8, width], [t, 0], valid_shape=[rows, width])
-                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, width)
-                value = pl.cast(source, pl.FP32)
-                inv = pl.rsqrt(pl.add(pl.mul(pl.row_sum(pl.mul(value, value)), 1.0 / width),
-                                     EPS), high_precision=True)
-                gamma = pl.reshape(pl.cast(weight[:], pl.FP32), [1, width])
-                normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv), gamma)
-                output[t:t + 8, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, width)
-        return output
-
-    return normalize
-
-
-def make_rope(heads, inverse=False):
-    sign = -1.0 if inverse else 1.0
-
-    @pl.jit.inline
-    def rotate(
-        x: pl.Tensor[[T_DYN, heads * HEAD_DIM], pl.BF16],
-        cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        output: pl.Tensor[[T_DYN, heads * HEAD_DIM], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        for block in pl.spmd(num_tokens * heads, name_hint="swa_rope"):
-            t = block // heads
-            h = block % heads
-            base = h * HEAD_DIM
-            output[t:t + 1, base:base + NOPE_DIM] = x[t:t + 1, base:base + NOPE_DIM]
-            tail = pl.cast(x[t:t + 1, base + NOPE_DIM:base + HEAD_DIM], pl.FP32)
-            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-            c = cos[t:t + 1, :]
-            s = pl.mul(sin[t:t + 1, :], sign)
-            re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-            im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-            rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-            rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-            output[t:t + 1, base + NOPE_DIM:base + HEAD_DIM] = pl.cast(rotated, pl.BF16, mode="rint")
-        return output
-
-    return rotate
 
 
 @pl.jit.inline
@@ -366,14 +224,7 @@ def grouped_output(
 if TP_SIZE not in (1, 2, 4):
     raise ValueError("Decode SWA currently supports TP1, TP2, and TP4; TP8 requires head-tile padding")
 
-project_qa = make_projection(D, Q_LORA)
-project_qb = make_projection(Q_LORA, LOCAL_H * HEAD_DIM)
-project_kv = make_projection(D, HEAD_DIM)
 project_ob = make_projection(LOCAL_O_WIDTH, D, pl.FP32)
-normalize_q = make_norm(Q_LORA)
-normalize_kv = make_norm(HEAD_DIM)
-rotate_q = make_rope(LOCAL_H)
-rotate_kv = make_rope(1)
 rotate_output = make_rope(LOCAL_H, inverse=True)
 
 
@@ -449,19 +300,16 @@ def decode_swa_partial(
     """Write the FP32 local output; return the cache-read completion task for caller WAR ordering."""
     tokens = pl.tensor.dim(x, 0)
     qa = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    project_qa(x, wq_a, wq_a_scale, qa, num_tokens)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    normalize_q(qa, q_norm_weight, qr, num_tokens)
+    q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qa, qr, num_tokens)
     qb = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    project_qb(qr, wq_b, wq_b_scale, qb, num_tokens)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    rotate_q(qb, rope_cos, rope_sin, q, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, qb, q, num_tokens)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    project_kv(x, wkv, wkv_scale, kv_projection, num_tokens)
     kv_normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    normalize_kv(kv_projection, kv_norm_weight, kv_normalized, num_tokens)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    rotate_kv(kv_normalized, rope_cos, rope_sin, kv, num_tokens)
+    kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
+                 kv_projection, kv_normalized, kv, num_tokens)
     publish_window(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
     selected = pl.create_tensor([tokens, 128, HEAD_DIM], dtype=pl.BF16)
     cache_consumed = gather_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)

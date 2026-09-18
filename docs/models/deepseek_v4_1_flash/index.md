@@ -97,6 +97,18 @@ python models/deepseek_v4_1_flash/decode_layer.py --stage attention -p a5 -d 0,1
 ```
 
 Use representative layer IDs 0, 2, and 3 for SWA, C2A Full, and C2A Reuse.
+
+Q/KV preprocessing lives in `qkv_proj_rope.py`. `q_proj_qr` writes the
+normalized Q latent, `q_proj_rope` expands and rotates it, and
+`kv_proj_rope` projects, normalizes, and rotates window KV. SWA and C2A
+prefill/decode use these stages; C2A Full also passes the same normalized
+latent to its indexer. Scratch remains caller-owned to preserve chunk
+reuse and task ordering. Prefill SWA uses the `prefill_*` stages to retain
+its group-32 scale-corrected BF16 Q projection and fixed-worker scheduling.
+Cache publication and TP communication stay in the Attention caller.
+C1A uses its existing preprocessing until its independent golden baseline
+and migration are accepted.
+
 TP1 and TP4 are supported by the half-layer validation entry. Each dispatch
 computes mHC mixes/pre and input RMSNorm, invokes Attention with consecutive
 communication epochs, then computes mHC post. Validation reuses each leaf's

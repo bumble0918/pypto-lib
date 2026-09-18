@@ -64,18 +64,12 @@ from models.deepseek_v4_1_flash.decode_swa import (
     grouped_output,
     make_projection,
     make_rope,
-    normalize_kv,
-    normalize_q,
-    project_kv,
     project_ob,
-    project_qa,
-    project_qb,
     publish_window,
-    rotate_kv,
     rotate_output,
-    rotate_q,
 )
 from models.deepseek_v4_1_flash.metadata import paged_slots, window_metadata
+from models.deepseek_v4_1_flash.qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
 from models.deepseek_v4_1_flash.quantization import (
     decode_e8m0,
     dequantize_mxfp4_cache,
@@ -901,20 +895,17 @@ def c2a_full_partial(
     tokens = pl.tensor.dim(x, 0)
 
     qa = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    project_qa(x, wq_a, wq_a_scale, qa, num_tokens)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    normalize_q(qa, q_norm_weight, qr, num_tokens)
+    q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qa, qr, num_tokens)
     qb = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    project_qb(qr, wq_b, wq_b_scale, qb, num_tokens)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    rotate_q(qb, rope_cos, rope_sin, query, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, qb, query, num_tokens)
 
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    project_kv(x, wkv, wkv_scale, kv_projection, num_tokens)
     kv_normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    normalize_kv(kv_projection, kv_norm_weight, kv_normalized, num_tokens)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    rotate_kv(kv_normalized, rope_cos, rope_sin, window_kv, num_tokens)
+    kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
+                 kv_projection, kv_normalized, window_kv, num_tokens)
     publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
